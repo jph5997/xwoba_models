@@ -1,0 +1,238 @@
+---
+title: "xwOBA-JH"
+author: "Jacob Hallowell"
+date: "2024-08-06"
+output: html_notebook
+---
+### Setup
+```{r}
+rm(list=ls()) # Clean the Environment
+
+library(lubridate)
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(data.table)
+```
+
+I will be creating xwOBA using MLB data. For the data, I want to get practice using the **baseballr** package. The first step is to load in the package and then start scraping the data. After I load the data I will use 2020-2022 to train and test on. After that I will use 2023 for descriptiveness, predictiveness, and reliablity testing. Since Statcast only allows downloading in smaller chunks, this function will help.
+```{r}
+# now I can read in the data
+data_2020 <- read.csv("statcast_2020.csv")
+data_2021 <- read.csv("statcast_2021.csv")
+data_2022 <- read.csv("statcast_2022.csv")
+data_2023 <- read.csv("statcast_2023.csv")
+
+all_data <- bind_rows(data_2020, data_2021, data_2022, data_2023)
+```
+I loaded in the CSVs that I saved so I did not have to scrape savant for a long period of time. In my other file *scraping_savant*, I scraped the data using baseballr.
+
+### Data Preprocessing
+Now that I have done that, the next step is to transform the data. I want to add a season column and filter out certain events. I need to add a column that shows whether or not the ball was put into play so I can do some work with wOBACON.
+```{r}
+# adding a season column so we can separate the data later for our DPR tests.
+all_data <- all_data %>%
+  mutate(game_date = as.Date(game_date),
+  season = year(game_date))
+
+# I want to add an index so I can join the predicted probabilities back into the table
+all_data <- all_data %>%
+  mutate(index = row_number())
+
+# next I want to create a column that classifies whether or not the ball was put into play
+# i can do this by listing the events that warrant a bip, such as single, double, etc
+all_data <- all_data %>%
+  mutate(bip = ifelse(!is.na(launch_speed) & launch_speed > 0 & description == "hit_into_play", 1, NA))
+
+# now I want to assign values for total bases
+all_data <- all_data %>%
+  mutate(tb = case_when(
+    events == "single" ~ "X1",
+    events == "double" ~ "X2",
+    events == "triple" ~ "X3",
+    events == "home_run" ~ "X4",
+    TRUE ~ "X0"
+  ))
+```
+
+I used X0-X4 as the options for the **tb column** because I will have to do less work when preparing the model. Now that I have cleaned the data, I can start setting up the next couple data frames that will be used in the xwOBA model. I collected batted ball data and split it into a training/testing set and the set that I will use to verify my xwOBA. The training and testing set will use data from 2020-2022, and I will make the xwOBA metric on my 2023 data.
+```{r}
+ball_in_play_df <- all_data %>%
+  filter(!is.na(bip)) %>%
+  drop_na(launch_speed, launch_angle, bip)
+
+# set up train data
+# Filter out 2023 data for training (2020-2022)
+bip_train <- ball_in_play_df %>% filter(season != 2023)
+
+# Filter 2023 data to apply the model to
+bip_2023 <- ball_in_play_df %>% filter(season == 2023)
+
+# this will be the full table of 2023
+df_2023 <- all_data %>% filter(season == 2023)
+```
+
+### Feature Selection & Model Building
+Now I need to do feature selection to put into the xwOBA model. MLB uses exit velocity and launch angle in their model, but they also use sprint speed on weak and topped hits. I will not be using sprint speed in this model, but maybe in different models going forward.
+```{r}
+bip_train$launch_angle <- as.numeric(bip_train$launch_angle)
+bip_train$launch_speed <- as.numeric(bip_train$launch_speed)
+bip_train$tb <- as.factor(bip_train$tb)
+
+bip_2023$launch_angle <- as.numeric(bip_2023$launch_angle)
+bip_2023$launch_speed <- as.numeric(bip_2023$launch_speed)
+bip_2023$tb <- as.factor(bip_2023$tb)
+
+features <- c("launch_speed", "launch_angle")
+target <- "tb"
+
+set.seed(123)
+
+
+trainIndex <- createDataPartition(bip_train[[target]], p = .8, list = FALSE)
+train_data <- bip_train[trainIndex, ]
+test_data <- bip_train[-trainIndex, ]
+```
+
+You will notice that I decided not to normalize the features because I didn't think the model would find them too complex. Now the features are setup and ready to put into the model.
+```{r}
+train_features <- train_data[, features]
+train_labels <- as.factor(train_data[[target]])
+test_features <- test_data[, features]
+test_labels <- as.factor(test_data[[target]])
+features_2023 <- bip_2023[, features]
+```
+
+This cell trains the model, which I only needed to do when I made changes to the model. Otherwise, I could just use the saveRDS and readRDS functions.
+```{r}
+# Train the KNN classifier using caret
+knn_model <- train(
+  x = train_features, 
+  y = train_labels, 
+  method = "knn", 
+  trControl = trainControl(method = "cv", number = 10, classProbs = TRUE)
+)
+
+#rf_model <- train(
+#  train_features, 
+#  train_labels, 
+#  method = "rf", 
+#  trControl = trainControl(method = "cv", number = 10, classProbs = TRUE)
+#)
+
+```
+
+I decided to go to with the KNN model, but I have code for a Random Forest model as well. I am a fan of Random Forest and have used it a lot, but for now I stuck with KNN. Future works could involve trying different models like RF, xgBoost, and more. I need to save this model again to avoid having to rerun it and wait a long time again. When I come back I should be able to just read the knn model with readRDS.
+```{r}
+saveRDS(knn_model, file = "knn_model_xwoba.rds")
+# use readRDS when I come back
+```
+
+Now I can read it back into the session.
+```{r}
+knn_model <- readRDS(file = "knn_model_xwoba.rds")
+```
+
+
+Now I want to get the probabilities and create a confusion matrix to compare.
+```{r}
+probabilities <- predict(knn_model, test_features, type = "prob")
+
+predicted_labels <- predict(knn_model, test_features)
+
+conf_matrix <- confusionMatrix(predicted_labels, test_labels)
+print(conf_matrix)
+```
+
+As you can see the model had a 76% accuracy, which isn't bad. However, I focus a lot less on the accuracy and more on the type of predictions the model is making. For example, the lack of predicted triples may be alarming, but given the features (EV, LA) it would be very hard to predict triples. Perhaps sprint speed would help with this.
+
+
+### Metric Creation
+Now that we have a KNN model, we can apply it to the dataset we created earlier. First, we need to use the model to predict on the 2023 data.
+```{r}
+probabilities_2023 <- predict(knn_model, features_2023, type = "prob")
+```
+
+Now we have the probabilities for 2023, so we can add the index back in and start making our metric.
+```{r}
+# I collected the weights for each TB option from Fangraphs
+weights <- c(0, 0.883, 1.244, 1.569, 2.004)
+
+#pred_woba <- rowSums(probabilities_2023 * weights)
+#weighted_probs <- sweep(probabilities_2023, 2, weights, FUN = "*")
+weighted_probs <- probabilities_2023 %>%
+  summarise(
+    X0 <- X0*0,
+    X1 <- X1 * 0.883,
+    X2 <- X2 * 1.244,
+    X3 <- X3 * 1.569,
+    X4 <- X4 * 2.004
+  )
+pred_woba <- rowSums(weighted_probs)
+bip_2023$pred_woba <- pred_woba # i now have xwOBACON
+```
+
+Now I need to add wOBA weights for events that were not put into play. This would include walks, HBP, and strikeouts. But first, I need to join back into the main df_2023 so we can see those events I mentioned.
+```{r}
+woba_df <- merge(df_2023, bip_2023[, c("index", "pred_woba")], 
+                   by = "index", all.x = TRUE)
+
+# these values were from Fangraphs Guts! as well
+woba_df$pred_woba[woba_df$events %in% c("walk")] <- 0.696
+woba_df$pred_woba[woba_df$events %in% c("hit_by_pitch")] <- 0.726
+woba_df$pred_woba[woba_df$events %in% c("strikeout", "strikeout_double_play")] <- 0
+
+# now I can filter out anything with a NA in pred_woba
+# can add more filters to see xwOBA on certain pitch groups, EVs, LAs, etc
+filtered_woba_df <- woba_df %>%
+  filter(!is.na(pred_woba)) %>%
+  filter(events != "catcher_interf") %>% 
+  select("batter", "player_name", "launch_speed", "launch_angle", "events", "description", "woba_value", "pred_woba")
+```
+
+Lastly, I will create the final xwOBA leaderboard for the 2023 season.
+```{r}
+leaderboard_2023 <- filtered_woba_df %>%
+  group_by(player_name, batter) %>%
+  summarize(
+    PA = n(),
+    wOBA = mean(woba_value, na.rm = TRUE),
+    xwOBA = mean(pred_woba, na.rm = TRUE)
+  )
+
+finaldf <- leaderboard_2023 %>%
+  filter(PA > 340)
+```
+
+Now I want to compare my qualified leaders to MLB's qualified leaders. I want to check the distribution and the correlation.
+```{r}
+xLeaders <- read.csv("qual_leaders.csv")
+```
+
+### Metric Evaluation
+I can join these together now and conduct a correlation analysis.
+```{r}
+comparison_df <- finaldf %>%
+  left_join(xLeaders %>% rename(mlb_xwoba = xwoba), by = c("batter" = "player_id"))
+
+comparison_df <- comparison_df %>%
+  filter(!is.na(mlb_xwoba)) %>%
+  select("player_name", "batter", "PA", "wOBA", "xwOBA", "mlb_xwoba")
+```
+
+Lets create a reliability plot to see how this correlates with xwoba.
+```{r}
+correlation <- cor(comparison_df$xwOBA, comparison_df$mlb_xwoba)
+
+# Create the scatter plot
+ggplot(comparison_df, aes(x = xwOBA, y = mlb_xwoba)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  ggtitle(paste("Correlation:", round(correlation, 2))) +
+  xlab("xwOBA") +
+  ylab("MLB xwOBA") +
+  theme_minimal()
+```
+
+
